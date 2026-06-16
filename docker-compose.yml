@@ -1,0 +1,47 @@
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  fastapi:
+    build: .
+    container_name: fastapi_app
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./service-account.json:/app/service-account.json:ro
+    depends_on:
+      - redis
+      - jaeger
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    command: >
+      sh -c "c=$${CELERY_WORKER_CONCURRENCY:-10};
+      if [ \"$$c\" -lt 10 ]; then c=10; fi;
+      celery -A src.celery_app.celery_app worker --loglevel=info -E --concurrency=$$c --prefetch-multiplier=1 -Ofair"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./service-account.json:/app/service-account.json:ro
+    depends_on:
+      - redis
+      - jaeger
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"

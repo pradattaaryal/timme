@@ -1,0 +1,77 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - GFJD-51
+
+env:
+  PROJECT_DIR: oxylab
+
+jobs:
+  deploy:
+    name: Deploy to production VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          PROJECT_DIR: ${{ env.PROJECT_DIR }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: PROJECT_DIR
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            PROJECT_PATH="${HOME}/${PROJECT_DIR}"
+
+            echo "==> Target path: $PROJECT_PATH"
+
+            # Clone repository if it doesn't exist
+            if [ ! -d "$PROJECT_PATH/.git" ]; then
+              echo "==> Repository not found. Cloning..."
+
+              # Replace with your actual repository URL
+              git clone https://github.com/pradattaaryal/timme.git "$PROJECT_PATH"
+            fi
+
+            cd "$PROJECT_PATH"
+
+            echo "==> Pulling latest changes"
+            git fetch origin
+            git reset --hard origin/main
+
+            echo "==> Building Docker images"
+            docker compose build
+
+            echo "==> Starting services"
+            docker compose up -d --remove-orphans
+
+            echo "==> Cleaning up unused Docker images"
+            docker image prune -f
+
+            echo "==> Container status"
+            docker compose ps
+
+            echo "==> Waiting for application health check"
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/ >/dev/null; then
+                echo " Application is healthy"
+                exit 0
+              fi
+
+              echo "Attempt $i/30 - waiting..."
+              sleep 2
+            done
+
+            echo " Health check failed"
+
+            docker compose ps || true
+            docker compose logs --tail=100 || true
+
+            exit 1
