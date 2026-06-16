@@ -3,7 +3,7 @@ name: Deploy to VPS
 on:
   push:
     branches:
-      - GFJD-51
+      - main
 
 env:
   PROJECT_DIR: oxylab
