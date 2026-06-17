@@ -58,15 +58,17 @@ def send_slack_message(text: str, *, mrkdwn: bool = True) -> bool:
     return _post_slack(payload)
 
 
-def _format_status_counts_line(status_counts: dict[str, int]) -> str | None:
-    parts = []
-    for key in ("success", "no_result", "error"):
-        count = status_counts.get(key, 0)
-        if count > 0:
-            parts.append(f"{STATUS_JA_LABELS[key]}: {count}")
-    if not parts:
-        return None
+def _format_status_counts_line(status_counts: dict[str, int]) -> str:
+    parts = [
+        f"{STATUS_JA_LABELS[key]}: {int(status_counts.get(key, 0) or 0)}"
+        for key in ("success", "no_result", "error")
+    ]
     return "ステータス: " + " | ".join(parts)
+
+
+def _format_progress_summary(*, processed: int, total: int) -> str:
+    pct = round((processed / total) * 100, 1) if total else 0
+    return f"進捗: {pct}%（処理済み {processed}/{total} 店舗）"
 
 
 def _format_live_progress_message(
@@ -79,7 +81,7 @@ def _format_live_progress_message(
 ) -> str:
     pct = round((processed / total) * 100, 1) if total else 0
     time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    progress_line = f"*Progress: {pct}%*"
+    progress_line = f"*進捗: {pct}%*"
     if notice_label:
         progress_line = f"{progress_line} {notice_label}"
 
@@ -88,13 +90,9 @@ def _format_live_progress_message(
         f"run_key: `{run_key}`",
         f"time: {time_str}",
         progress_line,
-        f"Processed {processed}/{total} stores",
-        "",
+        f"処理済み: {processed}/{total} 店舗",
+        _format_status_counts_line(status_counts),
     ]
-    if status_counts:
-        status_line = _format_status_counts_line(status_counts)
-        if status_line:
-            lines.append(status_line)
 
     return "\n".join(lines)
 
@@ -128,7 +126,7 @@ def send_progress_notice(
 ) -> bool:
     """Scheduled progress report at 9am, 2pm, or 5pm JST (live run only)."""
     now_jst = datetime.now(JST)
-    label = f"(scheduled update: {now_jst.strftime('%H:%M')} JST)"
+    label = f"(定時更新: {now_jst.strftime('%H:%M')} JST)"
     return send_live_progress_notice(
         run_key=run_key,
         total=total,
@@ -151,7 +149,7 @@ def send_interval_progress(
         total=total,
         processed=processed,
         status_counts=status_counts,
-        notice_label="(auto-update every 15 s)",
+        notice_label="(15秒ごとに自動更新)",
     )
 
 
@@ -161,6 +159,9 @@ def send_error_notice(
     batch_id: str,
     failed_stores: list[str] | None = None,
     error_msg: str = "",
+    total: int = 0,
+    processed: int = 0,
+    status_counts: dict[str, int] | None = None,
 ) -> bool:
     """Error alert when a batch encounters errors."""
     lines = [
@@ -169,11 +170,15 @@ def send_error_notice(
         f"batch_id: `{batch_id}`",
         "",
     ]
+    if total > 0:
+        lines.append(_format_progress_summary(processed=processed, total=total))
+    if status_counts is not None:
+        lines.append(_format_status_counts_line(status_counts))
     if error_msg:
-        lines.append(f"Error: {error_msg[:500]}")
+        lines.append(f"エラー: {error_msg[:500]}")
     if failed_stores:
         lines.append("")
-        lines.append("Failed queries (up to 5):")
+        lines.append("失敗したクエリ（最大5件）:")
         for i, q in enumerate(failed_stores, 1):
             lines.append(f"{i}. {q[:200]}")
     return send_slack_message("\n".join(lines))
@@ -200,11 +205,9 @@ def send_completion_notice(
         f"time: {time_str}",
         f"run_key: `{run_key}`",
         "",
-        (
-            f"結果: {total_records} 件 | "
-            f"{STATUS_JA_LABELS['success']}: {success} | "
-            f"{STATUS_JA_LABELS['no_result']}: {no_result} | "
-            f"{STATUS_JA_LABELS['error']}: {error}"
+        _format_progress_summary(processed=success + no_result + error, total=total_records),
+        _format_status_counts_line(
+            {"success": success, "no_result": no_result, "error": error},
         ),
         f"成功率: {success_rate}%",
         f"APIリクエスト数: {api_requests}",

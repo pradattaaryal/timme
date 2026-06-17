@@ -964,11 +964,30 @@ def run_monthly_acquisition(
                     # Slack error notice when any record in this batch failed
                     if err_n > 0 and failed_queries:
                         try:
+                            ok_total = sum(
+                                1 for log in state.processing_logs if log.get("status") == "success"
+                            )
+                            no_total = sum(
+                                1 for log in state.processing_logs if log.get("status") == "no_result"
+                            )
+                            err_total = sum(
+                                1 for log in state.processing_logs if log.get("status") == "error"
+                            )
                             send_error_notice(
                                 run_key=run_key,
                                 batch_id=batch_id,
                                 failed_stores=failed_queries[:5],
-                                error_msg=f"{err_n} store(s) failed in batch {batch_num}/{total_batches}",
+                                error_msg=(
+                                    f"バッチ {batch_num}/{total_batches} で "
+                                    f"{err_n} 店舗がエラーになりました"
+                                ),
+                                total=len(validation.valid_records),
+                                processed=len(state.processed_indices),
+                                status_counts={
+                                    "success": ok_total,
+                                    "no_result": no_total,
+                                    "error": err_total,
+                                },
                             )
                         except Exception:  # noqa: BLE001
                             logger.exception("Slack error notification failed (ignored)")
