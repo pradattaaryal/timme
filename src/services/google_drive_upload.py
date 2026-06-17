@@ -25,6 +25,26 @@ def _resolve_service_account_json_path(raw: str) -> Path:
     alt = (_project_root() / trimmed).resolve()
     if alt.is_file():
         return alt
+
+    cred_dir = _project_root() / "credential"
+    if cred_dir.is_dir():
+        candidates = sorted(cred_dir.glob("*.json"))
+        if len(candidates) == 1:
+            logger.warning(
+                "Google Drive: configured service account JSON not found at '%s'; "
+                "using sole credential file %s",
+                trimmed,
+                candidates[0].name,
+            )
+            return candidates[0].resolve()
+        if len(candidates) > 1:
+            logger.error(
+                "Google Drive upload skipped: service account JSON not found at '%s'. "
+                "Found %s JSON file(s) in credential/ — set GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON to the correct path.",
+                trimmed,
+                len(candidates),
+            )
+
     return p
 
 

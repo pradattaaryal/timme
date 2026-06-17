@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-     
-     
+
 import requests
 
 from src.config.settings import settings
@@ -14,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 _WEBHOOK_URL = (settings.SLACK_WEBHOOK_URL or "").strip()
 _WEBHOOK_TIMEOUT = 10  # seconds
+JST = timezone(timedelta(hours=9))
+SCHEDULED_PROGRESS_HOURS_JST = {9, 14, 17}
 
 
 def _should_send() -> bool:
@@ -49,6 +50,63 @@ def send_slack_message(text: str) -> bool:
     return _post_slack(payload)
 
 
+def _format_live_progress_message(
+    *,
+    run_key: str,
+    total: int,
+    processed: int,
+    status_counts: dict[str, int],
+    notice_label: str = "",
+) -> str:
+    pct = round((processed / total) * 100, 1) if total else 0
+    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    progress_line = f"*Progress: {pct}%*"
+    if notice_label:
+        progress_line = f"{progress_line} {notice_label}"
+
+    lines = [
+        "acquisition_progress",
+        f"run_key: `{run_key}`",
+        f"time: {time_str}",
+        progress_line,
+        f"Processed {processed}/{total} stores",
+        "",
+    ]
+    if status_counts:
+        parts = []
+        for key, label in [
+            ("success", ":large_green_circle:"),
+            ("no_result", ":white_circle:"),
+            ("error", ":red_circle:"),
+        ]:
+            if key in status_counts and status_counts[key] > 0:
+                parts.append(f"{label} {label}: {status_counts[key]}")
+        if parts:
+            lines.append("Status: " + " | ".join(parts))
+
+    return "\n".join(lines)
+
+
+def send_live_progress_notice(
+    *,
+    run_key: str,
+    total: int,
+    processed: int,
+    status_counts: dict[str, int],
+    notice_label: str = "",
+) -> bool:
+    """Live acquisition progress (shared by interval and scheduled JST updates)."""
+    return send_slack_message(
+        _format_live_progress_message(
+            run_key=run_key,
+            total=total,
+            processed=processed,
+            status_counts=status_counts,
+            notice_label=notice_label,
+        )
+    )
+
+
 def send_progress_notice(
     *,
     run_key: str,
@@ -56,29 +114,33 @@ def send_progress_notice(
     processed: int,
     status_counts: dict[str, int],
 ) -> bool:
-    """Progress report at scheduled hours (9am, 2pm, 5pm)."""
-    pct = round((processed / total) * 100, 1) if total else 0
-    now_jp = datetime.now(timezone.utc).astimezone()
-    time_str = now_jp.strftime("%Y-%m-%d %H:%M UTC")
+    """Scheduled progress report at 9am, 2pm, or 5pm JST (live run only)."""
+    now_jst = datetime.now(JST)
+    label = f"(scheduled update: {now_jst.strftime('%H:%M')} JST)"
+    return send_live_progress_notice(
+        run_key=run_key,
+        total=total,
+        processed=processed,
+        status_counts=status_counts,
+        notice_label=label,
+    )
 
-    lines = [
-        f"acquisition_progress",
-        f"run_key: `{run_key}`",
-        f"time: {time_str}",
-        "",
-        f"*Progress: {pct}%",
-        f"Processed {processed}/{total} stores",
-        "",
-    ]
-    if status_counts:
-        parts = []
-        for key, label in [("success", ":large_green_circle:"), ("no_result", ":white_circle:"), ("error", ":red_circle:")]:
-            if key in status_counts and status_counts[key] > 0:
-                parts.append(f"{label} {label}: {status_counts[key]}")
-        if parts:
-            lines.append("Status: " + " | ".join(parts))
 
-    return send_slack_message("\n".join(lines))
+def send_interval_progress(
+    *,
+    run_key: str,
+    total: int,
+    processed: int,
+    status_counts: dict[str, int],
+) -> bool:
+    """Periodic progress report (sent every 15 s during a live acquisition)."""
+    return send_live_progress_notice(
+        run_key=run_key,
+        total=total,
+        processed=processed,
+        status_counts=status_counts,
+        notice_label="(auto-update every 15 s)",
+    )
 
 
 def send_error_notice(
@@ -134,34 +196,4 @@ def send_completion_notice(
         lines.append(f"[Google Drive]({drive_url})")
     elif output_csv:
         lines.append(f"Output: `{output_csv}`")
-    return send_slack_message("\n".join(lines))
-
-
-def send_interval_progress(
-    *,
-    run_key: str,
-    total: int,
-    processed: int,
-    status_counts: dict[str, int],
-) -> bool:
-    """Periodic progress report (sent every 15 s during acquisition)."""
-    pct = round((processed / total) * 100, 1) if total else 0
-    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = [
-        f"acquisition_progress",
-        f"run_key: `{run_key}`",
-        f"time: {time_str}",
-        f"*Progress: {pct}%* (auto-update every 15 s)",
-        f"Processed {processed}/{total} stores",
-        "",
-    ]
-    if status_counts:
-        parts = []
-        for key, label in [("success", ":large_green_circle:"), ("no_result", ":white_circle:"), ("error", ":red_circle:")]:
-            if key in status_counts and status_counts[key] > 0:
-                parts.append(f"{label} {label}: {status_counts[key]}")
-        if parts:
-            lines.append("Status: " + " | ".join(parts))
-
     return send_slack_message("\n".join(lines))

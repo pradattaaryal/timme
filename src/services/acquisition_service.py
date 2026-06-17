@@ -29,8 +29,10 @@ from src.services.smtp_notification import send_drive_csv_link_email
 from src.services.slack_notification import (
     send_error_notice,
     send_completion_notice,
-    send_progress_notice,
     send_interval_progress,
+    send_progress_notice,
+    JST,
+    SCHEDULED_PROGRESS_HOURS_JST,
 )
 from src.telemetry.acquisition_tracing import (
     BatchTraceContext,
@@ -585,25 +587,49 @@ _interval_total: int = 0
 _interval_status: list[dict[str, int]] = []
 
 
+def _read_interval_progress_snapshot() -> tuple[str, int, dict[str, int], int]:
+    """Return (run_key, total, status_counts, processed) from the live progress snapshot."""
+    with _interval_lock:
+        counts: dict[str, int] = {}
+        if _interval_status:
+            counts = dict(_interval_status[0])
+        processed = counts.get("success", 0) + counts.get("no_result", 0) + counts.get("error", 0)
+        return _interval_run_key, _interval_total, counts, processed
+
+
+def _maybe_send_scheduled_progress(run_key: str, total: int, counts: dict[str, int], processed: int) -> None:
+    """Send one scheduled JST progress notice per hour while acquisition is live."""
+    now_jst = datetime.now(JST)
+    if now_jst.hour not in SCHEDULED_PROGRESS_HOURS_JST:
+        return
+
+    hour_key = f"{run_key}-{now_jst.strftime('%Y%m%d')}-{now_jst.hour}"
+    if hour_key in _progress_hours_fired:
+        return
+    _progress_hours_fired.add(hour_key)
+
+    try:
+        send_progress_notice(
+            run_key=run_key,
+            total=total,
+            processed=processed,
+            status_counts=counts,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Scheduled Slack progress notification failed (ignored)")
+
+
 def _interval_progress_worker() -> None:
-    """Background thread that posts Slack progress every 15 seconds until stopped."""
-    global _interval_stop_event, _interval_run_key, _interval_total, _interval_status
+    """Background thread: interval progress every 15 s; scheduled JST updates when live."""
+    global _interval_stop_event
     stop = _interval_stop_event
-    run_key = _interval_run_key
-    total = _interval_total
 
     while True:
-        # Wait up to 15 s for the stop event
         stop.wait(timeout=15)
         if stop.is_set():
             break
 
-        # Read current status snapshot under lock
-        with _interval_lock:
-            counts: dict[str, int] = {}
-            if _interval_status:
-                counts = dict(_interval_status[0])
-            processed = counts.get("success", 0) + counts.get("no_result", 0) + counts.get("error", 0)
+        run_key, total, counts, processed = _read_interval_progress_snapshot()
 
         try:
             send_interval_progress(
@@ -615,10 +641,12 @@ def _interval_progress_worker() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Interval progress Slack notification failed (ignored)")
 
+        _maybe_send_scheduled_progress(run_key, total, counts, processed)
+
 
 def _start_interval_progress(run_key: str, total: int, state: CheckpointState | None = None) -> None:
     """Start the background interval progress thread."""
-    global _interval_stop_event, _interval_thread, _interval_run_key, _interval_total, _interval_status
+    global _interval_stop_event, _interval_thread, _interval_run_key, _interval_total, _interval_status, _progress_hours_fired
 
     # If a previous thread is still running, stop it first.
     stop_previous_interval_thread()
@@ -626,6 +654,7 @@ def _start_interval_progress(run_key: str, total: int, state: CheckpointState | 
     _interval_run_key = run_key
     _interval_total = total
     _interval_stop_event = threading.Event()
+    _progress_hours_fired.clear()
 
     with _interval_lock:
         _interval_status.clear()
@@ -686,80 +715,6 @@ def stop_previous_interval_thread() -> None:
         _interval_thread = None
     with _interval_lock:
         _interval_status.clear()
-
-
-def _send_batch_progress(
-    *,
-    run_key: str,
-    total: int,
-    processed: int,
-    ok_n: int,
-    no_n: int,
-    err_n: int,
-    batch_num: int,
-    total_batches: int,
-) -> None:
-    """Send Slack progress notice at 9am/2pm/5pm JST if a run is active."""
-    from src.services.slack_notification import send_progress_notice
-
-    # Japan is UTC+9, use fixed offset to avoid pytz dependency
-    import datetime as _dt
-
-    class JST(_dt.tzinfo):
-        _offset = _dt.timedelta(hours=9)
-
-        def utcoffset(self, dt):
-            return self._offset
-
-        def tzname(self, dt):
-            return "JST"
-
-        def dst(self, dt):
-            return _dt.timedelta(0)
-
-    jst = JST()
-    now_jst = datetime.now(tz=jst)
-    current_hour = now_jst.hour
-    progress_hours = {9, 14, 17}
-    if current_hour not in progress_hours:
-        return
-    hour_key = f"{run_key}-{current_hour}"
-    if hour_key in _progress_hours_fired:
-        return
-    _progress_hours_fired.add(hour_key)
-
-    pct = round((processed / total) * 100, 1) if total else 0
-    time_str = now_jst.strftime("%Y-%m-%d %H:%M JST")
-
-    lines = [
-        f"acquisition_progress",
-        f"run_key: `{run_key}`",
-        f"time: {time_str}",
-        f"batch: {batch_num}/{total_batches}",
-        "",
-        f"*Progress: {pct}%",
-        f"Processed {processed}/{total} stores",
-        "",
-    ]
-    parts = []
-    if ok_n > 0:
-        parts.append(f"success: {ok_n}")
-    if no_n > 0:
-        parts.append(f"no_result: {no_n}")
-    if err_n > 0:
-        parts.append(f"error: {err_n}")
-    if parts:
-        lines.append("Status: " + " | ".join(parts))
-
-    try:
-        send_progress_notice(
-            run_key=run_key,
-            total=total,
-            processed=processed,
-            status_counts={"success": ok_n, "no_result": no_n, "error": err_n},
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Slack progress notification failed (ignored)")
 
 
 def run_monthly_acquisition(
@@ -1009,20 +964,6 @@ def run_monthly_acquisition(
                         except Exception:  # noqa: BLE001
                             logger.exception("Slack error notification failed (ignored)")
 
-                    # Slack progress notice at scheduled hours (9am, 2pm, 5pm)
-                    if len(validation.valid_records) > 0:
-                        _send_batch_progress(
-                            run_key=run_key,
-                            total=len(validation.valid_records),
-                            processed=len(state.processed_indices),
-                            ok_n=ok_n,
-                            no_n=no_n,
-                            err_n=err_n,
-                            batch_num=batch_num,
-                            total_batches=total_batches,
-                        )
-
-                    # Update status snapshot for the interval progress thread
                     if len(validation.valid_records) > 0:
                         _update_interval_status_from_state(state)
 
