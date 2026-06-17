@@ -45,6 +45,26 @@ def _resolve_service_account_json_path(raw: str) -> Path:
                 len(candidates),
             )
 
+    docker_default = (_project_root() / "service-account.json").resolve()
+    if docker_default.is_file():
+        logger.warning(
+            "Google Drive: configured service account JSON not found at '%s'; "
+            "using %s",
+            trimmed or "(empty)",
+            docker_default,
+        )
+        return docker_default
+
+    return p
+
+
+def _resolve_local_file_path(file_path: Path) -> Path:
+    p = Path(file_path)
+    if p.is_file():
+        return p.resolve()
+    alt = (_project_root() / p).resolve()
+    if alt.is_file():
+        return alt
     return p
 
 
@@ -139,11 +159,12 @@ def upload_local_file_to_drive(
             sa_email,
         )
 
-    file_path = Path(file_path)
+    file_path = _resolve_local_file_path(Path(file_path))
     if not file_path.is_file():
         logger.error(
-            "Google Drive upload skipped: output file not found at '%s'.",
+            "Google Drive upload skipped: output file not found at '%s' (cwd=%s).",
             file_path,
+            Path.cwd(),
         )
         return None
 

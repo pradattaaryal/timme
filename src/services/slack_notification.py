@@ -16,6 +16,12 @@ _WEBHOOK_TIMEOUT = 10  # seconds
 JST = timezone(timedelta(hours=9))
 SCHEDULED_PROGRESS_HOURS_JST = {9, 14, 17}
 
+STATUS_JA_LABELS = {
+    "success": "成功",
+    "no_result": "結果なし",
+    "error": "エラー",
+}
+
 
 def _should_send() -> bool:
     return bool(_WEBHOOK_URL)
@@ -44,10 +50,23 @@ def _format_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def send_slack_message(text: str) -> bool:
-    """Send an arbitrary plain-text message to Slack via webhook."""
-    payload = {"text": text}
+def send_slack_message(text: str, *, mrkdwn: bool = True) -> bool:
+    """Send a message to Slack via webhook (mrkdwn enabled by default)."""
+    payload: dict[str, Any] = {"text": text}
+    if mrkdwn:
+        payload["mrkdwn"] = True
     return _post_slack(payload)
+
+
+def _format_status_counts_line(status_counts: dict[str, int]) -> str | None:
+    parts = []
+    for key in ("success", "no_result", "error"):
+        count = status_counts.get(key, 0)
+        if count > 0:
+            parts.append(f"{STATUS_JA_LABELS[key]}: {count}")
+    if not parts:
+        return None
+    return "ステータス: " + " | ".join(parts)
 
 
 def _format_live_progress_message(
@@ -73,16 +92,9 @@ def _format_live_progress_message(
         "",
     ]
     if status_counts:
-        parts = []
-        for key, label in [
-            ("success", ":large_green_circle:"),
-            ("no_result", ":white_circle:"),
-            ("error", ":red_circle:"),
-        ]:
-            if key in status_counts and status_counts[key] > 0:
-                parts.append(f"{label} {label}: {status_counts[key]}")
-        if parts:
-            lines.append("Status: " + " | ".join(parts))
+        status_line = _format_status_counts_line(status_counts)
+        if status_line:
+            lines.append(status_line)
 
     return "\n".join(lines)
 
@@ -180,7 +192,7 @@ def send_completion_notice(
     drive_url: str = "",
 ) -> bool:
     """Completion summary after pipeline finishes."""
-    overall_status = ":large_green_circle: completed" if error == 0 else ":red_circle: completed with errors"
+    overall_status = "完了" if error == 0 else "完了（エラーあり）"
     time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
@@ -188,12 +200,20 @@ def send_completion_notice(
         f"time: {time_str}",
         f"run_key: `{run_key}`",
         "",
-        f"Results: {total_records} total | {success} success | {no_result} no_result | {error} error",
-        f"Success rate: {success_rate}%",
-        f"API requests: {api_requests}",
+        (
+            f"結果: {total_records} 件 | "
+            f"{STATUS_JA_LABELS['success']}: {success} | "
+            f"{STATUS_JA_LABELS['no_result']}: {no_result} | "
+            f"{STATUS_JA_LABELS['error']}: {error}"
+        ),
+        f"成功率: {success_rate}%",
+        f"APIリクエスト数: {api_requests}",
     ]
-    if drive_url:
-        lines.append(f"[Google Drive]({drive_url})")
+    link = (drive_url or "").strip()
+    if link:
+        label = output_csv or "Google Drive CSV"
+        lines.append(f"Google Drive: <{link}|{label}>")
+        lines.append(link)
     elif output_csv:
-        lines.append(f"Output: `{output_csv}`")
+        lines.append(f"出力ファイル: `{output_csv}`（Driveアップロードなし）")
     return send_slack_message("\n".join(lines))

@@ -102,6 +102,15 @@ SUMMARY_METRIC_JA_MAP = {
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _repo_relative_path(raw: str) -> Path:
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return (_PROJECT_ROOT / p).resolve()
+
 EXECUTION_REPORT_COLUMNS: list[str] = [
     "timestamp",
     "run_key",
@@ -732,8 +741,8 @@ def run_monthly_acquisition(
         source_path = settings.INPUT_PATH
     else:
         source_path = normalized_input_path
-    output_dir = Path(settings.OUTPUT_DIR)
-    log_dir = Path(settings.LOG_DIR)
+    output_dir = _repo_relative_path(settings.OUTPUT_DIR)
+    log_dir = _repo_relative_path(settings.LOG_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1061,11 +1070,28 @@ def run_monthly_acquisition(
                 f"https://temp.invalid/acquisition-csv?export={stamp}&file={output_csv_path.name}"
             )
         else:
+            drive_upload = None
             with span_drive_upload(trace_ctx, file_name=output_csv_path.name):
-                drive_upload = upload_local_file_to_drive(
+                for attempt in range(1, 3):
+                    drive_upload = upload_local_file_to_drive(
+                        output_csv_path,
+                        service_account_json=settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON,
+                        parent_folder_id=settings.GOOGLE_DRIVE_FOLDER_ID,
+                    )
+                    if drive_upload:
+                        break
+                    if attempt < 2:
+                        logger.warning(
+                            "Google Drive upload attempt %s failed for '%s'; retrying...",
+                            attempt,
+                            output_csv_path.name,
+                        )
+                        time.sleep(2)
+            if not drive_upload:
+                logger.error(
+                    "Google Drive upload failed after retries for '%s'. "
+                    "Check GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON, GOOGLE_DRIVE_FOLDER_ID, and worker logs.",
                     output_csv_path,
-                    service_account_json=settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON,
-                    parent_folder_id=settings.GOOGLE_DRIVE_FOLDER_ID,
                 )
             output_csv_drive_file_id = drive_upload.file_id if drive_upload else None
             output_csv_drive_url = drive_upload.url if drive_upload else ""

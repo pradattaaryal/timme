@@ -18,6 +18,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./src:/app/src
+      - ./credential:/app/credential:ro
       - ./service-account.json:/app/service-account.json:ro
     depends_on:
       - redis
@@ -35,6 +36,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./src:/app/src
+      - ./credential:/app/credential:ro
       - ./service-account.json:/app/service-account.json:ro
     depends_on:
       - redis
