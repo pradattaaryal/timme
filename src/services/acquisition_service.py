@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from src.services.slack_notification import (
     send_error_notice,
     send_completion_notice,
     send_progress_notice,
+    send_interval_progress,
 )
 from src.telemetry.acquisition_tracing import (
     BatchTraceContext,
@@ -574,6 +576,117 @@ def _ingest_process_result(
 
 _progress_hours_fired: set[str] = set()
 
+# Module-level lock and thread for the interval progress reporter.
+_interval_lock = threading.Lock()
+_interval_thread: threading.Thread | None = None
+_interval_stop_event: threading.Event | None = None
+_interval_run_key: str = ""
+_interval_total: int = 0
+_interval_status: list[dict[str, int]] = []
+
+
+def _interval_progress_worker() -> None:
+    """Background thread that posts Slack progress every 15 seconds until stopped."""
+    global _interval_stop_event, _interval_run_key, _interval_total, _interval_status
+    stop = _interval_stop_event
+    run_key = _interval_run_key
+    total = _interval_total
+
+    while True:
+        # Wait up to 15 s for the stop event
+        stop.wait(timeout=15)
+        if stop.is_set():
+            break
+
+        # Read current status snapshot under lock
+        with _interval_lock:
+            counts: dict[str, int] = {}
+            if _interval_status:
+                counts = dict(_interval_status[0])
+            processed = counts.get("success", 0) + counts.get("no_result", 0) + counts.get("error", 0)
+
+        try:
+            send_interval_progress(
+                run_key=run_key,
+                total=total,
+                processed=processed,
+                status_counts=counts,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Interval progress Slack notification failed (ignored)")
+
+
+def _start_interval_progress(run_key: str, total: int, state: CheckpointState | None = None) -> None:
+    """Start the background interval progress thread."""
+    global _interval_stop_event, _interval_thread, _interval_run_key, _interval_total, _interval_status
+
+    # If a previous thread is still running, stop it first.
+    stop_previous_interval_thread()
+
+    _interval_run_key = run_key
+    _interval_total = total
+    _interval_stop_event = threading.Event()
+
+    with _interval_lock:
+        _interval_status.clear()
+        if state is not None:
+            ok = sum(1 for log in state.processing_logs if log.get("status") == "success")
+            no = sum(1 for log in state.processing_logs if log.get("status") == "no_result")
+            err = sum(1 for log in state.processing_logs if log.get("status") == "error")
+            _interval_status.append({"success": ok, "no_result": no, "error": err})
+        else:
+            _interval_status.append({"success": 0, "no_result": 0, "error": 0})
+
+    _interval_thread = threading.Thread(target=_interval_progress_worker, daemon=True, name="slack-interval-progress")
+    _interval_thread.start()
+
+
+def _stop_interval_progress() -> None:
+    """Signal the background thread to stop and join it."""
+    global _interval_thread
+
+    if _interval_stop_event:
+        _interval_stop_event.set()
+    t = _interval_thread
+    if t is not None:
+        t.join(timeout=20)
+        _interval_thread = None
+
+
+def _update_interval_status(status_counts: dict[str, int]) -> None:
+    """Thread-safe update of the latest status counts (read by the interval thread)."""
+    with _interval_lock:
+        if _interval_status:
+            _interval_status[0] = status_counts
+        else:
+            _interval_status.append(status_counts)
+
+
+def _update_interval_status_from_state(state: CheckpointState) -> None:
+    """Read counts from CheckpointState and update the interval thread snapshot."""
+    ok = sum(1 for log in state.processing_logs if log.get("status") == "success")
+    no = sum(1 for log in state.processing_logs if log.get("status") == "no_result")
+    err = sum(1 for log in state.processing_logs if log.get("status") == "error")
+    _update_interval_status({"success": ok, "no_result": no, "error": err})
+
+
+def _interval_progress_active() -> bool:
+    t = _interval_thread
+    return t is not None and t.is_alive()
+
+
+def stop_previous_interval_thread() -> None:
+    """Convenience wrapper to stop any previously running interval thread."""
+    global _interval_stop_event, _interval_thread, _interval_status
+    if _interval_stop_event:
+        _interval_stop_event.set()
+    t = _interval_thread
+    if t is not None:
+        t.join(timeout=20)
+        _interval_thread = None
+    with _interval_lock:
+        _interval_status.clear()
+
 
 def _send_batch_progress(
     *,
@@ -792,6 +905,8 @@ def run_monthly_acquisition(
                                 dead_entries=dead_entries,
                                 validation=validation,
                             )
+                            if _interval_progress_active():
+                                _update_interval_status_from_state(state)
                             with span_checkpoint_save(record_index=idx):
                                 _save_checkpoint(checkpoint_file, state)
                             with span_csv_partial_export(
@@ -817,6 +932,10 @@ def run_monthly_acquisition(
                     worker_count=wc_batch,
                 )
 
+                # Start interval progress thread on first batch
+                if batch_start == 0 and len(validation.valid_records) > 0:
+                    _start_interval_progress(run_key, len(validation.valid_records), state)
+
                 with span_batch_process(batch_ctx) as batch_span:
                     by_idx = _run_slice(batch_ctx, batch_indices, is_retry=False, retry_pass=0)
                     for retry_pass in range(1, settings.BATCH_ERROR_RETRY_PASSES + 1):
@@ -826,6 +945,8 @@ def run_monthly_acquisition(
                         _purge_state_for_indices(state, validation, failed)
                         partial_csv_writer.rebuild(state.rows)
                         partial_csv_writer.mark_indices_written(set(state.processed_indices))
+                        if _interval_progress_active():
+                            _update_interval_status_from_state(state)
                         with span_checkpoint_save(record_index=-1):
                             _save_checkpoint(checkpoint_file, state)
                         retry_by = _run_slice(
@@ -900,6 +1021,10 @@ def run_monthly_acquisition(
                             batch_num=batch_num,
                             total_batches=total_batches,
                         )
+
+                    # Update status snapshot for the interval progress thread
+                    if len(validation.valid_records) > 0:
+                        _update_interval_status_from_state(state)
 
                 if settings.BATCH_DELAY_SECONDS > 0 and batch_start + batch_size < len(processing_order):
                     time.sleep(settings.BATCH_DELAY_SECONDS)
@@ -1116,6 +1241,9 @@ def run_monthly_acquisition(
         logger.info("Execution report Excel written: %s", per_exec_excel)
         if partial_output_csv:
             logger.info("Partial batch CSV (incremental export): %s", partial_output_csv)
+
+        # Stop interval progress thread before sending final completion notice
+        _stop_interval_progress()
 
         # Slack completion notice
         try:

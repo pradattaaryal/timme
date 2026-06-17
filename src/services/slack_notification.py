@@ -135,3 +135,33 @@ def send_completion_notice(
     elif output_csv:
         lines.append(f"Output: `{output_csv}`")
     return send_slack_message("\n".join(lines))
+
+
+def send_interval_progress(
+    *,
+    run_key: str,
+    total: int,
+    processed: int,
+    status_counts: dict[str, int],
+) -> bool:
+    """Periodic progress report (sent every 15 s during acquisition)."""
+    pct = round((processed / total) * 100, 1) if total else 0
+    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        f"acquisition_progress",
+        f"run_key: `{run_key}`",
+        f"time: {time_str}",
+        f"*Progress: {pct}%* (auto-update every 15 s)",
+        f"Processed {processed}/{total} stores",
+        "",
+    ]
+    if status_counts:
+        parts = []
+        for key, label in [("success", ":large_green_circle:"), ("no_result", ":white_circle:"), ("error", ":red_circle:")]:
+            if key in status_counts and status_counts[key] > 0:
+                parts.append(f"{label} {label}: {status_counts[key]}")
+        if parts:
+            lines.append("Status: " + " | ".join(parts))
+
+    return send_slack_message("\n".join(lines))
